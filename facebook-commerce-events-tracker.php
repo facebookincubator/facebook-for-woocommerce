@@ -18,6 +18,10 @@ if ( ! class_exists( 'WC_Facebookcommerce_EventsTracker' ) ) :
 		include_once 'facebook-commerce-pixel-event.php';
 	}
 
+	if ( ! class_exists( 'WC_Facebookcommerce_ServerEventSender' ) ) {
+		include_once 'facebook-server-event-sender.php';
+	}
+
 	class WC_Facebookcommerce_EventsTracker {
 		private $pixel;
 		private static $isEnabled = true;
@@ -55,6 +59,7 @@ if ( ! class_exists( 'WC_Facebookcommerce_EventsTracker' ) ) :
 			add_action( 'woocommerce_add_to_cart', [ $this, 'inject_add_to_cart_event' ], 40, 4 );
 			// AddToCart while AJAX is enabled
 			add_action( 'woocommerce_ajax_added_to_cart', [ $this, 'add_filter_for_add_to_cart_fragments' ] );
+			add_action( 'woocommerce_ajax_added_to_cart', [ $this, 'send_tracked_events' ], 10, 2 );
 			// AddToCart while using redirect to cart page
 			if ( 'yes' === get_option( 'woocommerce_cart_redirect_after_add' ) ) {
 				add_filter( 'woocommerce_add_to_cart_redirect', [ $this, 'set_last_product_added_to_cart_upon_redirect' ], 10, 2 );
@@ -70,6 +75,13 @@ if ( ! class_exists( 'WC_Facebookcommerce_EventsTracker' ) ) :
 
 			// TODO move this in some 3rd party plugin integrations handler at some point {FN 2020-03-20}
 			add_action( 'wpcf7_contact_form', [ $this, 'inject_lead_event_hook' ], self::FB_PRIORITY_LOW );
+
+			//Adds the send_tracked_event method to the wp_footer action
+			add_action( 'wp_footer' ,  [ $this, 'send_tracked_events' ] , 10, 2);
+		}
+
+		public function send_tracked_events(){
+			do_action( 'wc_facebook_send_server_event', WC_Facebookcommerce_ServerEventSender::get_instance()->get_tracked_events(), WC_Facebookcommerce_ServerEventSender::get_instance()->get_num_tracked_events() );
 		}
 
 		public function apply_filters() {
@@ -525,6 +537,7 @@ if ( ! class_exists( 'WC_Facebookcommerce_EventsTracker' ) ) :
 
 					$content->id       = \WC_Facebookcommerce_Utils::get_fb_retailer_id( $product );
 					$content->quantity = $quantity;
+					$content->item_price = floatval($item->get_total());
 
 					$contents[] = $content;
 					$num_items += $quantity;
@@ -536,7 +549,7 @@ if ( ! class_exists( 'WC_Facebookcommerce_EventsTracker' ) ) :
 				'content_ids'  => wp_json_encode( array_merge( ... $product_ids ) ),
 				'contents'     => wp_json_encode( $contents ),
 				'content_type' => $content_type,
-				'value'        => $order->get_total(),
+				'value'        => floatval($order->get_total()),
 				'currency'     => get_woocommerce_currency(),
 			] );
 
@@ -570,7 +583,7 @@ if ( ! class_exists( 'WC_Facebookcommerce_EventsTracker' ) ) :
 				// TODO consider including (int|float) 'predicted_ltv': "Predicted lifetime value of a subscriber as defined by the advertiser and expressed as an exact value." {FN 2020-03-20}
 				$this->pixel->inject_event( 'Subscribe', [
 					'sign_up_fee' => $subscription->get_sign_up_fee(),
-					'value'       => $subscription->get_total(),
+					'value'       => floatval($subscription->get_total()),
 					'currency'    => get_woocommerce_currency(),
 				] );
 			}
@@ -676,6 +689,7 @@ if ( ! class_exists( 'WC_Facebookcommerce_EventsTracker' ) ) :
 
 					$content->id       = \WC_Facebookcommerce_Utils::get_fb_retailer_id( $item['data'] );
 					$content->quantity = $item['quantity'];
+					$content->item_price = floatval($item['data']->get_price());
 
 					$cart_contents[] = $content;
 				}
@@ -688,11 +702,10 @@ if ( ! class_exists( 'WC_Facebookcommerce_EventsTracker' ) ) :
 		/**
 		 * Gets the cart total.
 		 *
-		 * @return float|int
+		 * @return float
 		 */
 		private function get_cart_total() {
-
-			return WC()->cart ? WC()->cart->total : 0;
+			return WC()->cart ? floatval(WC()->cart->total) : 0.0;
 		}
 
 
