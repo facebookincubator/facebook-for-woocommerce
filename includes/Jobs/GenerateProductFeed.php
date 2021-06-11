@@ -22,6 +22,27 @@ class GenerateProductFeed extends AbstractChainedJob {
 	use BatchQueryOffset, LoggingTrait;
 
 	/**
+	 * Transient used to accumulate feed execution time.
+	 *
+	 * @var string
+	 */
+	const TRANSIENT_FEED_GENERATION_TIME_SPENT = 'facebook_for_woocommerce_feed_generation_time_spent';
+
+	/**
+	 * Transient key to store feed generation start timestamp.
+	 *
+	 * @var string
+	 */
+	const TRANSIENT_FEED_GENERATION_START_TIME = 'facebook_for_woocommerce_feed_generation_start_time';
+
+	/**
+	 * Transient key to store feed generation end timestamp.
+	 *
+	 * @var string
+	 */
+	const TRANSIENT_FEED_GENERATION_END_TIME = 'facebook_for_woocommerce_feed_generation_end_time';
+
+	/**
 	 * Feed file creation and manipulation utility.
 	 *
 	 * @var FeedFileHandler $feed_file_handler.
@@ -56,6 +77,27 @@ class GenerateProductFeed extends AbstractChainedJob {
 		$this->feed_file_handler->write_to_temp_file(
 			$this->feed_data_exporter->generate_header()
 		);
+		// Reset the statistics counters.
+		facebook_for_woocommerce()->get_tracker()->track_feed_file_generation_time( 0 );
+		$this->track_feed_file_generation_start( time() );
+		$this->clear_feed_generation_time_spent();
+	}
+
+	/**
+	 * Handle processing a chain batch.
+	 *
+	 * @hooked {plugin_name}/jobs/{job_name}/chain_batch
+	 *
+	 * @param int   $batch_number The batch number for the new batch.
+	 * @param array $args         The args for the job.
+	 *
+	 * @throws Exception On error. The failure will be logged by Action Scheduler and the job chain will stop.
+	 */
+	public function handle_batch_action( int $batch_number, array $args ) {
+		$start_time = microtime( true );
+		parent::handle_batch_action( $batch_number, $args );
+		$batch_generation_time = microtime( true ) - $start_time;
+		$this->add_feed_generation_time_spent( $batch_generation_time );
 	}
 
 	/**
@@ -63,6 +105,10 @@ class GenerateProductFeed extends AbstractChainedJob {
 	 */
 	protected function handle_end() {
 		$this->feed_file_handler->replace_feed_file_with_temp_file();
+		$this->track_feed_file_generation_end( time() );
+		facebook_for_woocommerce()->get_tracker()->track_feed_file_generation_time(
+			$this->get_feed_file_generation_time_spent()
+		);
 	}
 
 	/**
@@ -200,7 +246,7 @@ class GenerateProductFeed extends AbstractChainedJob {
 	 *
 	 * @return int
 	 */
-	protected function get_batch_size(): int {
+	public function get_batch_size(): int {
 		/**
 		 * Feed batch size filter.
 		 *
@@ -217,6 +263,63 @@ class GenerateProductFeed extends AbstractChainedJob {
 		 * @param int  $batch_size Size of the feed processing batch.
 		 */
 		return apply_filters( 'facebook_for_woocommerce_feed_generation_num_products_per_batch', 15 );
+	}
+
+	/**
+	 * Increases the time spend for the feed file generation.
+	 *
+	 * @since x.x.x
+	 * @param Float $time_increase Time to add to the total feed file generation time.
+	 */
+	private function add_feed_generation_time_spent( $time_increase ) {
+		// Add processing time to previously accumulated execution times.
+		set_transient(
+			self::TRANSIENT_FEED_GENERATION_TIME_SPENT,
+			$this->get_feed_file_generation_time_spent() + $time_increase,
+			DAY_IN_SECONDS
+		);
+	}
+
+	/**
+	 * Get feed generation execution length.
+	 *
+	 * @since x.x.x
+	 */
+	private function get_feed_file_generation_time_spent() {
+		return get_transient( self::TRANSIENT_FEED_GENERATION_TIME_SPENT );
+	}
+
+	/**
+	 * Clear the feed generation time spent.
+	 *
+	 * @since x.x.x
+	 */
+	private function clear_feed_generation_time_spent() {
+		set_transient( self::TRANSIENT_FEED_GENERATION_TIME_SPENT, 0, DAY_IN_SECONDS );
+	}
+
+	/**
+	 * Update transient with feed file generation start time.
+	 * This function and track_feed_file_generation_end are used for timing when we should schedule our next feed generation time.
+	 * We don't want to overshoot and be still generating the feed file when Facebook will request the file.
+	 * If we will know how much time it takes to generate the feed file on this server we will be able to schedule generation in advance
+	 * to the request.
+	 *
+	 * @since x.x.x
+	 * @param Int $timestamp Time when the generation has been started.
+	 */
+	private function track_feed_file_generation_start( $timestamp ) {
+		set_transient( self::TRANSIENT_FEED_GENERATION_START_TIME, $timestamp, DAY_IN_SECONDS );
+	}
+
+	/**
+	 * Update transient with feed file generation end (in seconds).
+	 *
+	 * @since x.x.x
+	 * @param Int $timestamp Time when the generation has been ended.
+	 */
+	private function track_feed_file_generation_end( $timestamp ) {
+		set_transient( self::TRANSIENT_FEED_GENERATION_END_TIME, $timestamp, DAY_IN_SECONDS );
 	}
 
 }

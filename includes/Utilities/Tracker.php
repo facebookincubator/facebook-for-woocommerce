@@ -29,7 +29,7 @@ class Tracker {
 	const TRANSIENT_WCTRACKER_LIFE_TIME = 2 * WEEK_IN_SECONDS;
 
 	/**
-	 * Transient key name; how long it took to generate the most recent feed file, or zero if it failed.
+	 * Transient key to store how long it took to generate one feed file products batch.
 	 *
 	 * @var string
 	 */
@@ -103,12 +103,15 @@ class Tracker {
 		$data['extensions']['facebook-for-woocommerce']['messenger-enabled'] = wc_bool_to_string( $messenger_enabled );
 
 		/**
-		 * How long did the last feed generation take (or did it fail - 0)?
+		 * Feed generation performance statistics and batch size.
+		 * 0 in feed-generation-time means tha the process has failed.
 		 *
 		 * @since x.x.x
 		 */
 		$feed_generation_time = get_transient( self::TRANSIENT_WCTRACKER_FEED_GENERATION_TIME );
 		$data['extensions']['facebook-for-woocommerce']['feed-generation-time'] = floatval( $feed_generation_time );
+		$feed_generation_num_products_per_batch = facebook_for_woocommerce()->job_registry->generate_product_feed_job->get_batch_size();
+		$data['extensions']['facebook-for-woocommerce']['feed-generation-num-products-per-batch'] = (int) $feed_generation_num_products_per_batch;
 
 		/**
 		 * Has the feed file been requested since the last snapshot?
@@ -140,11 +143,10 @@ class Tracker {
 	}
 
 	/**
-	 * Update transient with feed file generation time (in seconds).
-	 *
-	 * Note this is used to clear the transient (set to -1) to track feed generation failure.
+	 * Update transient with feed file generation average time (in seconds).
 	 *
 	 * @since x.x.x
+	 * @param Float $time_in_seconds Time it takes to generate the feed file. 0 means that the generation has failed.
 	 */
 	public function track_feed_file_generation_time( $time_in_seconds ) {
 		set_transient( self::TRANSIENT_WCTRACKER_FEED_GENERATION_TIME, $time_in_seconds, self::TRANSIENT_WCTRACKER_LIFE_TIME );
