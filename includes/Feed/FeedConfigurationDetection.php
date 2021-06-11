@@ -14,11 +14,20 @@ use SkyVerge\WooCommerce\Facebook\Utilities\Heartbeat;
  */
 class FeedConfigurationDetection {
 
+	// Transient used for blocking too frequent configuration fetches.
+	const FEED_CONFIG_CHECK_TRANSIENT = 'wc_facebook_for_woocommerce_feed_config_check';
+	// Option for storing user facing cached information about the configuration problems.
+	const FEED_CONFIG_MESSAGE_OPTION = 'wc_facebook_for_woocommerce_feed_config_message_option';
+	// How long is transient valid in case we have a correct configuration.
+	const FEED_CONFIG_VALID_CHECK_INTERVAL = DAY_IN_SECONDS;
+	// How long is transient valid in case we have an incorrect configuration.
+	const FEED_CONFIG_INVALID_CHECK_INTERVAL = 15 * MINUTE_IN_SECONDS;
 	/**
 	 * Constructor.
 	 */
 	public function __construct() {
 		add_action( Heartbeat::DAILY, array( $this, 'track_data_source_feed_tracker_info' ) );
+		add_action( 'admin_init', array( $this, 'evaluate_feed_config' ) );
 	}
 
 	/**
@@ -57,7 +66,7 @@ class FeedConfigurationDetection {
 
 		// No catalog id. Most probably means that we don't have a valid connection.
 		if ( '' === $catalog_id ) {
-			throw new Error( 'No catalog ID' );
+			throw new Error( __( 'No catalog ID.', 'facebook-for-woocommerce' ) );
 		}
 
 		// Get all feeds configured for the catalog.
@@ -67,7 +76,7 @@ class FeedConfigurationDetection {
 
 		// Check if the catalog has any feed configured.
 		if ( empty( $feed_nodes ) ) {
-			throw new Error( 'No feed nodes for catalog' );
+			throw new Error( __( 'No feed nodes for catalog.', 'facebook-for-woocommerce' ) );
 		}
 
 		/*
@@ -146,6 +155,384 @@ class FeedConfigurationDetection {
 	}
 
 	/**
+	 * Feed detection procedure entry point.
+	 *
+	 * Check the feed configuration. Memoize the check outcome.
+	 * Prevent too frequent checks.
+	 *
+	 * @since x.x.x
+	 * @return void
+	 */
+	public function evaluate_feed_config() {
+		if ( ! facebook_for_woocommerce()->get_connection_handler()->is_connected() ) {
+			return;
+		}
+		$feed_check_transient = get_transient( self::FEED_CONFIG_CHECK_TRANSIENT );
+		if ( $feed_check_transient ) {
+			$message_method = get_option( self::FEED_CONFIG_MESSAGE_OPTION, false );
+			if ( $message_method ) {
+				add_action( 'admin_notices', array( $this, $message_method ) );
+			}
+			return true;
+		}
+
+		$config_is_valid = false;
+
+		try {
+			$config_is_valid = $this->has_valid_feed_config();
+			delete_option( self::FEED_CONFIG_MESSAGE_OPTION );
+			if ( ! $config_is_valid ) {
+				// TODO trigger automattic feed configuration creation.
+			}
+		} catch ( FeedInactiveException $exception ) {
+			// Inform user that the feed is blocked.
+			add_action( 'admin_notices', array( $this, 'check_documentation_for_stale_feed_notice' ) );
+			update_option( self::FEED_CONFIG_MESSAGE_OPTION, 'check_documentation_for_stale_feed_notice' );
+		} catch ( FeedBadConfigException $exception ) {
+			// Inform user that the feed configuration is broken.
+			add_action( 'admin_notices', array( $this, 'check_documentation_for_invalid_config' ) );
+			update_option( self::FEED_CONFIG_MESSAGE_OPTION, 'check_documentation_for_invalid_config' );
+		} catch ( Error $error ) {
+			facebook_for_woocommerce()->log( 'Error evaluating feed configuration' . $error->getMessage() );
+		}
+
+		// Block next check for some time.
+		set_transient(
+			self::FEED_CONFIG_CHECK_TRANSIENT,
+			true,
+			$config_is_valid ? self::FEED_CONFIG_VALID_CHECK_INTERVAL : self::FEED_CONFIG_INVALID_CHECK_INTERVAL
+		);
+	}
+
+	/**
+	 * Check if we have a valid feed configuration.
+	 *
+	 * Steps:
+	 * 1. Check if we have valid catalog id.
+	 *  - No catalog id ( probably not connected ): throw Error
+	 * 2. Fetch all feed configuration for catalog.
+	 * 3. Check if we have feed id stored.
+	 *  - No feeds configured: continue to 6.
+	 *  - Feed configured: continue to 4.
+	 * 4. Check if stored feed id is one the feed configurations defined.
+	 *  - feed id found in one of the configurations: continue to 5
+	 *  - feed id not found in one of the configurations: remove feed id from the integration and continue to 6.
+	 * 5. Check if stored feed id has valid configuration:
+	 *  - yes: return true.
+	 *  - no: continue to 6.
+	 * 6. Check if we have any stored configs
+	 *  - yes: continue.
+	 *  - no: return false.
+	 * 7. Loop over feed configurations.
+	 *    - check if feed has a valid config:
+	 *      - yes: store that feed id as integration feed id: return true
+	 *      - no: loop to the next stored feed
+	 * 8. All configs checked and no one was valid: throw Exception
+	 *
+	 * Validation of a feed configuration ( used in the algorithm above ):
+	 * 1. Check if schedule is correct
+	 * 2. Check if url is correct
+	 * 3. Check if there are recent uploads.
+	 *
+	 * For schedule checks we are only interested in `schedule` and not in `update_schedule`.
+	 *
+	 * @throws Error No catalog error or API problems.
+	 * @throws FeedBadConfigException Partial feed configuration.
+	 * @return bool True value means that we have a valid configuration.
+	 *                         False means that we have no configuration at all.
+	 * @since x.x.x
+	 */
+	public function has_valid_feed_config() {
+		$integration         = facebook_for_woocommerce()->get_integration();
+		$graph_api           = $integration->get_graph_api();
+		$integration_feed_id = $integration->get_feed_id();
+		$catalog_id          = $integration->get_product_catalog_id();
+
+		// No catalog id. Most probably means that we don't have a valid connection.
+		if ( '' === $catalog_id ) {
+			throw new Error( __( 'No catalog ID.', 'facebook-for-woocommerce' ) );
+		}
+
+		// Get all feeds configured for the catalog.
+		try {
+			$feed_nodes = $this->get_feed_nodes_for_catalog( $catalog_id, $graph_api );
+		} catch ( Error $er ) {
+			throw $er;
+		}
+
+		/**
+		 * Check if our stored feed id is on the list of available feed ids.
+		*/
+		if ( $integration_feed_id ) {
+			$exists = false;
+			// Check if any of the feeds is currently active.
+			foreach ( $feed_nodes as $feed ) {
+				if ( $integration_feed_id === $feed['id'] ) {
+					$exists = true;
+					break;
+				}
+			}
+
+			if ( ! $exists ) {
+				// Unset the integration feed id because it does not exist in the available feeds configuration.
+				$integration_feed_id = false;
+				$integration->update_feed_id( '' );
+			}
+		}
+
+		// Check if our stored feed id represents a valid configuration.
+		$is_integration_feed_config_valid = $this->evaluate_integration_feed( $integration_feed_id, $graph_api );
+
+		if ( $is_integration_feed_config_valid ) {
+			// Our stored feed id represents a valid feed configuration. Next check if it is active.
+			return true;
+		}
+
+		// Check if the catalog has any feed configured.
+		if ( empty( $feed_nodes ) ) {
+			// This is the only situation where we will automatically create facebook catalog configuration.
+			return false;
+		}
+
+		// Check if any of the feeds is currently active.
+		foreach ( $feed_nodes as $feed ) {
+			$feed_config_valid = $this->evaluate_facebook_feed_config( $feed['id'], $graph_api );
+			if ( $feed_config_valid ) {
+				return true;
+			}
+		}
+
+		/*
+		 * If we are here it means that integration does not have a valid feed configured.
+		 * It also means that there are feed configurations defined in Facebook Catalog that we can't match to something useful.
+		 * The best course of action is for merchant to manually adjust ( or delete ) the configurations that he has in teh Facebook Catalog settings.
+		 */
+		throw new FeedBadConfigException();
+	}
+
+	/**
+	 * Admin notice displayed when the configuration seems to be valid but feed is stale.
+	 */
+	public function check_documentation_for_stale_feed_notice() {
+		$class   = 'notice notice-warning is-dismissible';
+		$message = __( 'Feed upload is blocked. Check you feed configuration in Facebook Dataset config.', 'facebook-for-woocommerce' );
+
+		printf( '<div class="%1$s"><p>%2$s</p></div>', esc_attr( $class ), esc_html( $message ) );
+	}
+
+	/**
+	 * Admin notice displayed when the configuration is not valid.
+	 */
+	public function check_documentation_for_invalid_config() {
+		$class   = 'notice notice-warning is-dismissible';
+		$message = __( 'Your Facebook Feed configuration is not valid. Please check plugin documentation for more information on how to proceed.', 'facebook-for-woocommerce' );
+
+		printf( '<div class="%1$s"><p>%2$s</p></div>', esc_attr( $class ), esc_html( $message ) );
+	}
+
+	/**
+	 * This function validates the Facebook feed for any configurations issues.
+	 *
+	 * @throws Error Failed to fetch the feed information.
+	 * @param String                        $feed_id Facebook Feed ID.
+	 * @param WC_Facebookcommerce_Graph_API $graph_api Facebook Graph handler instance.
+	 * @since x.x.x
+	 *
+	 * @return bool True means that this feed is configured correctly
+	 *              False means that we have no configuration at all.
+	 */
+	private function evaluate_facebook_feed_config( $feed_id, $graph_api ) {
+		$integration = facebook_for_woocommerce()->get_integration();
+		try {
+			$is_integration_feed_config_valid = $this->is_feed_config_valid( $feed_id, $graph_api );
+			if ( $is_integration_feed_config_valid ) {
+				// We have a valid feed configuration that is not our stored integration feed. We can assume that this should be our feed.
+				$integration->update_feed_id( $feed_id );
+				return true;
+			}
+		} catch ( FeedInactiveException $exception ) {
+			// We have a valid feed configuration that is not our stored integration feed. We can assume that this should be our feed.
+			$integration->update_feed_id( $feed_id );
+			// Inform user that the feed is blocked.
+			add_action( 'admin_notices', array( $this, 'check_documentation_for_stale_feed_notice' ) );
+			// We return true because we assume that the feed configuration is valid and there is something else blocking the feed.
+			return true;
+		} catch ( Error $er ) {
+			throw $er;
+		}
+		return false;
+	}
+
+	/**
+	 * This function validates the integration ( stored feed id ) configuration.
+	 *
+	 * @throws Error Failed to fetch the feed information.
+	 * @param String                        $integration_feed_id Facebook Feed ID.
+	 * @param WC_Facebookcommerce_Graph_API $graph_api Facebook Graph handler instance.
+	 * @since x.x.x
+	 *
+	 * @return bool True means that this feed is configured correctly
+	 *              False means that we have no configuration at all.
+	 */
+	private function evaluate_integration_feed( $integration_feed_id, $graph_api ) {
+		if ( $integration_feed_id ) {
+			try {
+				$is_integration_feed_config_valid = $this->is_feed_config_valid( $integration_feed_id, $graph_api );
+				// Inform user that the feed configuration is broken.
+				if ( ! $is_integration_feed_config_valid ) {
+					throw new FeedBadConfigException();
+				}
+				// All is good. Integration feed is configured successfully.
+				return true;
+			} catch ( FeedInactiveException $exception ) {
+				throw $exception;
+			} catch ( Error $th ) {
+				// General error that should not happened.
+				throw $th;
+			}
+		} else {
+			return false;
+		}
+	}
+
+	/**
+	 * This function validates the Facebook feed for any configurations issues.
+	 *
+	 * @throws FeedInactiveException Feed not configured correctly.
+	 * @throws Error Failed to fetch the feed information.
+	 * @param String                        $feed_id Facebook Feed ID.
+	 * @param WC_Facebookcommerce_Graph_API $graph_api Facebook Graph handler instance.
+	 * @since x.x.x
+	 *
+	 * @return bool True means that this feed is configured correctly
+	 *              False means that we have no configuration at all.
+	 */
+	private function is_feed_config_valid( $feed_id, $graph_api ) {
+		try {
+			$feed_information = $this->get_feed_information( $feed_id, $graph_api );
+		} catch ( Error $th ) {
+			throw $th;
+		}
+
+		$feed_has_correct_schedule = $this->feed_has_correct_schedule( $feed_information );
+		$feed_is_using_correct_url = $this->feed_is_using_correct_url( $feed_information );
+		$feed_has_correct_config   = $feed_is_using_correct_url && $feed_has_correct_schedule;
+
+		if ( ! $feed_has_correct_config ) {
+			// Config incorrect.
+			return false;
+		}
+
+		if ( ! $this->feed_has_recent_uploads( $feed_information ) ) {
+			// Configuration is correct but for some reason the feed is not active. This will require manual check by the merchant in settings.
+			throw new FeedInactiveException();
+		}
+
+		return true;
+	}
+
+	/**
+	 * Check if feed schedule configuration matches our recommendation.
+	 *
+	 * @param Array $feed_information Feed configuration information.
+	 * @since x.x.x
+	 *
+	 * @return bool Is the feed schedule configured correctly.
+	 */
+	private function feed_has_correct_schedule( $feed_information ) {
+		$schedule = $feed_information['schedule'] ?? null;
+		if ( null === $schedule ) {
+			return false;
+		}
+
+		/**
+		 * Filters what interval should be used for the scheduled evaluation.
+		 * Allows for fine tuning the upload schedule.
+		 *
+		 * @param string $interval Interval used for schedule.
+		 * @since x.x.x
+		 */
+		$feed_has_correct_interval = apply_filters( 'facebook_for_woocommerce_feed_interval', 'DAILY' ) === $schedule['interval'];
+
+		/**
+		 * Filters what interval count should be used for the scheduled evaluation.
+		 * Allows for fine tuning the upload schedule.
+		 *
+		 * @param int $interval_count Interval count used for schedule.
+		 * @since x.x.x
+		 */
+		$feed_has_correct_interval_count = apply_filters( 'facebook_for_woocommerce_feed_interval', 1 ) === $schedule['interval_count'];
+
+		return $feed_has_correct_interval && $feed_has_correct_interval_count;
+	}
+
+	/**
+	 * Does feed contains any recent uploads.
+	 * This only checks upload attempts and not if the upload has managed to succeed.
+	 *
+	 * @param Array $feed_information Feed configuration information.
+	 * @since x.x.x
+	 *
+	 * @return bool Feed has valid uploads in the 2 weeks time span.
+	 */
+	private function feed_has_recent_uploads( $feed_information ) {
+		if ( empty( $feed_information['uploads']['data'] ) ) {
+			return false;
+		}
+
+		$current_time = time();
+		foreach ( $feed_information['uploads']['data'] as $upload ) {
+			$end_time = strtotime( $upload['end_time'] );
+
+			/*
+			 * Maximum interval is a weak.
+			 * We check for two weeks to take into account a possible failure of the last upload.
+			 * Highly unlikely but possible.
+			 */
+			if ( ( ( $end_time + 2 * WEEK_IN_SECONDS ) > $current_time ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Determine if the feed uses correct upload URL.
+	 *
+	 * @param Array $feed_information Feed configuration information.
+	 * @since x.x.x
+	 *
+	 * @return bool True if this site URL matches feed configured URL. False otherwise.
+	 */
+	private function feed_is_using_correct_url( $feed_information ) {
+		$schedule = $feed_information['schedule'] ?? null;
+		if ( null === $schedule ) {
+			return false;
+		}
+		$feed_api_url = FeedFileHandler::get_feed_data_url();
+		return $schedule['url'] === $feed_api_url;
+	}
+
+	/**
+	 * Given a Feed ID fetches feed configuration information from Facebook.
+	 *
+	 * @throws Error Could not fetch feed information.
+	 * @param String                        $feed_id Facebook Feed ID.
+	 * @param WC_Facebookcommerce_Graph_API $graph_api Facebook Graph handler instance.
+	 * @since x.x.x
+	 *
+	 * @return array Feed configuration.
+	 */
+	private function get_feed_information( $feed_id, $graph_api ) {
+		$response = $graph_api->read_feed_information( $feed_id );
+		$code     = (int) wp_remote_retrieve_response_code( $response );
+		if ( 200 !== $code ) {
+			throw new Error( __( 'Reading feed information error.', 'facebook-for-woocommerce' ), $code );
+		}
+		return json_decode( wp_remote_retrieve_body( $response ), true );
+	}
+
+	/**
 	 * Given catalog id this function fetches all feed configurations defined for this catalog.
 	 *
 	 * @throws Error Feed configurations fetch was not successful.
@@ -159,7 +546,7 @@ class FeedConfigurationDetection {
 		$response = $graph_api->read_feeds( $catalog_id );
 		$code     = (int) wp_remote_retrieve_response_code( $response );
 		if ( 200 !== $code ) {
-			throw new Error( 'Reading catalog feeds error', $code );
+			throw new Error( __( 'Reading catalog feeds error.', 'facebook-for-woocommerce' ), $code );
 		}
 
 		$response_body = wp_remote_retrieve_body( $response );
@@ -181,7 +568,7 @@ class FeedConfigurationDetection {
 		$response = $graph_api->read_feed_metadata( $feed_id );
 		$code     = (int) wp_remote_retrieve_response_code( $response );
 		if ( 200 !== $code ) {
-			throw new Error( 'Error reading feed metadata', $code );
+			throw new Error( __( 'Error reading feed metadata.', 'facebook-for-woocommerce' ), $code );
 		}
 		$response_body = wp_remote_retrieve_body( $response );
 		return json_decode( $response_body, true );
@@ -200,7 +587,7 @@ class FeedConfigurationDetection {
 		$response = $graph_api->read_upload_metadata( $upload_id );
 		$code     = (int) wp_remote_retrieve_response_code( $response );
 		if ( 200 !== $code ) {
-			throw new Error( 'Error reading feed upload metadata', $code );
+			throw new Error( __( 'Error reading feed upload metadata.', 'facebook-for-woocommerce' ), $code );
 		}
 		$response_body = wp_remote_retrieve_body( $response );
 		return json_decode( $response_body, true );
