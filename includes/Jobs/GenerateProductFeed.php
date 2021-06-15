@@ -2,8 +2,11 @@
 
 namespace SkyVerge\WooCommerce\Facebook\Jobs;
 
+use Automattic\WooCommerce\ActionSchedulerJobFramework\Proxies\ActionSchedulerInterface;
 use Automattic\WooCommerce\ActionSchedulerJobFramework\Utilities\BatchQueryOffset;
 use Exception;
+use SkyVerge\WooCommerce\Facebook\Feed\FeedDataExporter;
+use SkyVerge\WooCommerce\Facebook\Feed\FeedFileHandler;
 use WC_Facebookcommerce;
 use WC_Product;
 
@@ -19,17 +22,100 @@ class GenerateProductFeed extends AbstractChainedJob {
 	use BatchQueryOffset, LoggingTrait;
 
 	/**
+	 * Feed file creation and manipulation utility.
+	 *
+	 * @var FeedFileHandler $feed_file_handler.
+	 */
+	protected $feed_file_handler;
+
+	/**
+	 * Exports data from WC_Product to format recognized by the feed.
+	 *
+	 * @var FeedDataExporter $feed_data_exporter.
+	 */
+	protected $feed_data_exporter;
+
+	/**
+	 * Constructor.
+	 *
+	 * @param ActionSchedulerInterface $action_scheduler   Action Scheduler facade.
+	 * @param FeedFileHandler          $feed_file_handler  Feed file creation and manipulation handler.
+	 * @param FeedDataExporter         $feed_data_exporter Handling of file data.
+	 */
+	public function __construct( ActionSchedulerInterface $action_scheduler, $feed_file_handler, $feed_data_exporter ) {
+		parent::__construct( $action_scheduler );
+		$this->feed_file_handler  = $feed_file_handler;
+		$this->feed_data_exporter = $feed_data_exporter;
+	}
+
+	/**
 	 * Called before starting the job.
 	 */
 	protected function handle_start() {
-		// Optionally override this method in child class.
+		$this->feed_file_handler->prepare_new_temp_file();
+		$this->feed_file_handler->write_to_temp_file(
+			$this->feed_data_exporter->generate_header()
+		);
 	}
 
 	/**
 	 * Called after the finishing the job.
 	 */
 	protected function handle_end() {
-		// Optionally override this method in child class.
+		$this->feed_file_handler->replace_feed_file_with_temp_file();
+	}
+
+	/**
+	 * Processes a batch of items.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param array $items The items of the current batch.
+	 * @param array $args  The args for the job.
+	 *
+	 * @throws Exception On error. The failure will be logged by Action Scheduler and the job chain will stop.
+	 */
+	protected function process_items( array $items, array $args ) {
+		/*
+		 * Pre-fetch full product objects.
+		 * Variable products will be filtered out here since we don't need them for the feed. It's important to not
+		 * filter out variable products in ::get_items_for_batch() because if a batch only contains variable products
+		 * the job will end prematurely thinking it has nothing more to process.
+		 */
+		$products = wc_get_products(
+			array(
+				'type'    => array( 'simple', 'variation' ),
+				'include' => $items,
+				'orderby' => 'none',
+			)
+		);
+
+		$processed_items = array();
+
+		foreach ( $products as $product ) {
+			// Check if product is enabled for synchronization.
+			if ( ! facebook_for_woocommerce()->get_product_sync_validator( $product )->passes_all_checks() ) {
+				continue;
+			}
+			$processed_items[] = $this->process_item( $product, $args );
+		}
+
+		$this->write_processed_items_to_feed( $processed_items );
+	}
+
+	/**
+	 * After processing send items to the feed file.
+	 *
+	 * @param array $processed_items Array of product fields to write to the feed file.
+	 */
+	protected function write_processed_items_to_feed( $processed_items ) {
+		// Check if we have any items to write.
+		if ( empty( $processed_items ) ) {
+			return;
+		}
+		$this->feed_file_handler->write_to_temp_file(
+			$this->feed_data_exporter->format_items_for_feed( $processed_items )
+		);
 	}
 
 	/**
@@ -49,8 +135,8 @@ class GenerateProductFeed extends AbstractChainedJob {
 		$product_ids = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT post.ID
-				FROM wp_posts as post
-				LEFT JOIN wp_posts as parent ON post.post_parent = parent.ID
+				FROM {$wpdb->posts} as post
+				LEFT JOIN {$wpdb->posts} as parent ON post.post_parent = parent.ID
 				WHERE
 					( post.post_type = 'product_variation' AND parent.post_status = 'publish' )
 				OR
@@ -66,29 +152,6 @@ class GenerateProductFeed extends AbstractChainedJob {
 	}
 
 	/**
-	 * Filter-like function that runs before items in a batch are processed.
-	 *
-	 * For example, this could be useful for pre-fetching full objects.
-	 *
-	 * @param array $items
-	 *
-	 * @return array
-	 */
-	protected function filter_items_before_processing( array $items ): array {
-		// Pre-fetch full product objects.
-		// Variable products will be filtered out here since we don't need them for the feed. It's important to not
-		// filter out variable products in ::get_items_for_batch() because if a batch only contains variable products
-		// the job will end prematurely thinking it has nothing more to process.
-		return wc_get_products(
-			[
-				'type'    => [ 'simple', 'variation' ],
-				'include' => $items,
-				'orderby' => 'none',
-			]
-		);
-	}
-
-	/**
 	 * Process a single item.
 	 *
 	 * @param WC_Product $product A single item from the get_items_for_batch() method.
@@ -101,8 +164,7 @@ class GenerateProductFeed extends AbstractChainedJob {
 			if ( ! $product ) {
 				throw new Exception( 'Product not found.' );
 			}
-
-			$this->log( $product->get_id() );
+			return $this->feed_data_exporter->generate_row_data( $product );
 
 		} catch ( Exception $e ) {
 			$this->log(
@@ -139,7 +201,22 @@ class GenerateProductFeed extends AbstractChainedJob {
 	 * @return int
 	 */
 	protected function get_batch_size(): int {
-		return 15;
+		/**
+		 * Feed batch size filter.
+		 *
+		 * This filter allows modification of how many items will be processed in one batch during the feed file generation.
+		 * Increasing the number of items per batch can potentially speed up processing on some of the sites.
+		 * Bigger number means reducing the number of required batches, but at the same time increase the memory requirements for the process.
+		 * Smaller number of items per batch means that the memory requirements are smaller for the process and the stability of the system is better.
+		 * The number of required batches increases and the the total time for processing may be longer.
+		 * Some, especially big sites with big products catalog, may want to increase this value in order to process the catalog faster.
+		 * This requires careful approach, bumping the value too high may lead to out of memory issues.
+		 *
+		 * @since x.x.x
+		 *
+		 * @param int  $batch_size Size of the feed processing batch.
+		 */
+		return apply_filters( 'facebook_for_woocommerce_feed_generation_num_products_per_batch', 15 );
 	}
 
 }

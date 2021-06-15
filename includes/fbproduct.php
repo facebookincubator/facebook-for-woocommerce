@@ -54,10 +54,14 @@ if ( ! class_exists( 'WC_Facebook_Product' ) ) :
 		);
 
 		public function __construct( $wpid, $parent_product = null ) {
-
-			$this->id                     = $wpid;
+			if ( $wpid instanceof WC_Product ) {
+				$this->id          = $wpid->get_id();
+				$this->woo_product = $wpid;
+			} else {
+				$this->id          = $wpid;
+				$this->woo_product = wc_get_product( $wpid );
+			}
 			$this->fb_description         = '';
-			$this->woo_product            = wc_get_product( $wpid );
 			$this->gallery_urls           = null;
 			$this->fb_use_parent_image    = null;
 			$this->main_description       = '';
@@ -347,17 +351,13 @@ if ( ! class_exists( 'WC_Facebook_Product' ) ) :
 			return $description;
 		}
 
+		/**
+		 * @param array $product_data
+		 * @param bool $for_items_batch
+		 *
+		 * @return array
+		 */
 		public function add_sale_price( $product_data, $for_items_batch = false ) {
-
-			// initialise sale price
-			if ( $for_items_batch ) {
-				$product_data['sale_price_effective_date'] = self::MIN_DATE_1 . self::MIN_TIME . '/' . self::MIN_DATE_2 . self::MAX_TIME;
-			} else {
-				$product_data['sale_price_start_date'] = self::MIN_DATE_1 . self::MIN_TIME;
-				$product_data['sale_price_end_date']   = self::MIN_DATE_2 . self::MAX_TIME;
-			}
-			$product_data['sale_price'] = $product_data['price'];
-
 			$sale_price = $this->woo_product->get_sale_price();
 
 			// check if sale exist
@@ -396,7 +396,6 @@ if ( ! class_exists( 'WC_Facebook_Product' ) ) :
 		 * Determines whether a product should be excluded from all-products sync or the feed file.
 		 *
 		 * @see SkyVerge\WooCommerce\Facebook\Products\Sync::create_or_update_all_products()
-		 * @see WC_Facebook_Product_Feed::write_product_feed_file()
 		 *
 		 * @deprecated 2.0.2
 		 */
@@ -614,7 +613,7 @@ if ( ! class_exists( 'WC_Facebook_Product' ) ) :
 				$product_data['checkout_url'] = $checkout_url;
 			}
 
-			// IF using WPML, set the product to staging unless it is in the
+			// IF using WPML, set the product to hidden unless it is in the
 			// default language. WPML >= 3.2 Supported.
 			if ( defined( 'ICL_LANGUAGE_CODE' ) ) {
 				if ( class_exists( 'WC_Facebook_WPML_Injector' ) && WC_Facebook_WPML_Injector::should_hide( $id ) ) {
