@@ -59,7 +59,7 @@ class Integrations {
 
 		foreach ( $registered_integrations as $class_name => $path ) {
 
-			if ( ! class_exists( $class_name ) && ! is_readable( $path ) ) {
+			if ( ! class_exists( $class_name ) && is_readable( __DIR__ . '/../..' . $path ) ) {
 
 				$this->integrations[ $class_name ] = $this->plugin->load_class( $path, $class_name );
 			}
